@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
 import { erc20Abi, isAddress } from 'viem'
 import { ConnectKitButton } from 'connectkit'
@@ -27,12 +27,25 @@ import QRScanSheet, { type QRResult } from './QRScanSheet'
 import PrivacySheet, { type PrivacySettings } from './PrivacySheet'
 import ChatWidget, { type AgentIntent } from './ChatWidget'
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const CHAIN_ID = 5042002 // Arc Testnet
+const CHAIN_ID = 5042002
 const USDC_FACT = getUsdc(CHAIN_ID)!
 const USDC_ADDRESS = USDC_FACT.address as `0x${string}`
+const ARCPAY_ADDRESS = '0xDa5f9cEb9eD17d7F7c633bC1Ebc6132fc10aB4c6' as `0x${string}`
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+const arcPayAbi = [
+  {
+    type: 'function',
+    name: 'pay',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'to', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+      { name: 'ref', type: 'bytes32' },
+    ],
+    outputs: [],
+  },
+] as const
+
 interface TxRecord {
   hash: string
   direction: 'sent' | 'received'
@@ -42,7 +55,6 @@ interface TxRecord {
   ts: number
 }
 
-// ─── Glass helper ─────────────────────────────────────────────────────────────
 const glass = {
   card: {
     background: 'var(--surface-strong)',
@@ -68,7 +80,6 @@ function formatAddr(addr: string) {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`
 }
 
-// ─── BalanceCard ──────────────────────────────────────────────────────────────
 function BalanceCard({ onSend, onRequest }: { onSend: () => void; onRequest: () => void }) {
   const { address, isConnected } = useAccount()
 
@@ -150,7 +161,6 @@ function BalanceCard({ onSend, onRequest }: { onSend: () => void; onRequest: () 
   )
 }
 
-// ─── SendSheet ────────────────────────────────────────────────────────────────
 function SendSheet({
   open,
   onClose,
@@ -168,9 +178,20 @@ function SendSheet({
   const { switchChain } = useSwitchChain()
   const { writeContract, data: hash, isPending, error: writeError } = useWriteContract()
   const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ hash })
+  const {
+    writeContract: writeApprove,
+    data: approveHash,
+    isPending: approvePending,
+    error: approveError,
+  } = useWriteContract()
+  const { isLoading: approveConfirming, isSuccess: approveSuccess } = useWaitForTransactionReceipt({
+    hash: approveHash,
+  })
 
   const [to, setTo] = useState(initialTo)
   const [amount, setAmount] = useState(initialAmount)
+  const [recorded, setRecorded] = useState(false)
+  const paySent = useRef(false)
 
   const { data: rawBalance } = useReadContract({
     address: USDC_ADDRESS,
@@ -187,7 +208,8 @@ function SendSheet({
   const isWrongChain = walletChainId !== CHAIN_ID
   const isValidAddr = isAddress(to)
   const isValidAmount = Boolean(amount && parseFloat(amount) > 0)
-  const canSend = isConnected && isValidAddr && isValidAmount && !isPending && !isConfirming && !isSuccess
+  const busy = isPending || isConfirming || approvePending || approveConfirming
+  const canSend = isConnected && isValidAddr && isValidAmount && !busy && !isSuccess
 
   const handleSend = useCallback(() => {
     if (isWrongChain) {
@@ -195,17 +217,30 @@ function SendSheet({
       return
     }
     if (!isValidAddr || !isValidAmount) return
+    paySent.current = false
     const parsed = parseAmount(CHAIN_ID, amount)
-    writeContract({
+    writeApprove({
       address: USDC_ADDRESS,
       abi: erc20Abi,
-      functionName: 'transfer',
-      args: [to, parsed.raw],
+      functionName: 'approve',
+      args: [ARCPAY_ADDRESS, parsed.raw],
       chainId: CHAIN_ID,
     })
-  }, [isWrongChain, isValidAddr, isValidAmount, amount, to, switchChain, writeContract])
+  }, [isWrongChain, isValidAddr, isValidAmount, amount, switchChain, writeApprove])
 
-  const [recorded, setRecorded] = useState(false)
+  useEffect(() => {
+    if (!approveSuccess || !isValidAddr || !isValidAmount || paySent.current) return
+    paySent.current = true
+    const parsed = parseAmount(CHAIN_ID, amount)
+    writeContract({
+      address: ARCPAY_ADDRESS,
+      abi: arcPayAbi,
+      functionName: 'pay',
+      args: [to as `0x${string}`, parsed.raw, `0x${'0'.repeat(64)}`],
+      chainId: CHAIN_ID,
+    })
+  }, [approveSuccess, isValidAddr, isValidAmount, amount, to, writeContract])
+
   useEffect(() => {
     if (isSuccess && hash && !recorded) {
       setRecorded(true)
@@ -218,17 +253,19 @@ function SendSheet({
         ts: Date.now(),
       })
     }
-  }, [isSuccess, hash, recorded])
+  }, [isSuccess, hash, recorded, onSuccess, amount, to, address])
 
   const handleClose = () => {
-    if (isPending || isConfirming) return
+    if (busy) return
     setTo('')
     setAmount('')
     setRecorded(false)
+    paySent.current = false
     onClose()
   }
 
   const presets = ['0.01', '0.10', '0.50', '1.00']
+  const error = approveError || writeError
 
   return (
     <AnimatePresence>
@@ -366,11 +403,11 @@ function SendSheet({
                     ))}
                   </div>
 
-                  {writeError && (
+                  {error && (
                     <p className="mb-3 rounded-xl px-3 py-2 text-xs" style={{ background: 'rgba(186,43,76,0.08)', color: 'var(--danger)' }}>
-                      {writeError.message.includes('user rejected')
+                      {error.message.includes('user rejected')
                         ? 'Transaction cancelled.'
-                        : writeError.message.includes('insufficient')
+                        : error.message.includes('insufficient')
                         ? 'Insufficient USDC balance.'
                         : 'Transaction failed. Please try again.'}
                     </p>
@@ -386,13 +423,9 @@ function SendSheet({
                       'Connect Wallet'
                     ) : isWrongChain ? (
                       'Switch to Arc Testnet'
-                    ) : isPending ? (
+                    ) : busy ? (
                       <span className="flex items-center justify-center gap-2">
-                        <Loader2 className="size-4 animate-spin" /> Confirm in wallet…
-                      </span>
-                    ) : isConfirming ? (
-                      <span className="flex items-center justify-center gap-2">
-                        <Loader2 className="size-4 animate-spin" /> Confirming…
+                        <Loader2 className="size-4 animate-spin" /> Processing…
                       </span>
                     ) : (
                       'Send USDC'
@@ -408,7 +441,6 @@ function SendSheet({
   )
 }
 
-// ─── RequestSheet ─────────────────────────────────────────────────────────────
 function RequestSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { address } = useAccount()
   const [amount, setAmount] = useState('')
@@ -553,7 +585,6 @@ function RequestSheet({ open, onClose }: { open: boolean; onClose: () => void })
   )
 }
 
-// ─── PrefillBanner ────────────────────────────────────────────────────────────
 function PrefillBanner({ onPay, onDismiss }: { onPay: (to: string, amount: string, memo?: string) => void; onDismiss: () => void }) {
   const params = new URLSearchParams(window.location.search)
   const to = params.get('to') ?? ''
@@ -604,7 +635,6 @@ function PrefillBanner({ onPay, onDismiss }: { onPay: (to: string, amount: strin
   )
 }
 
-// ─── ActivityList ─────────────────────────────────────────────────────────────
 function ActivityList({ txs }: { txs: TxRecord[] }) {
   if (txs.length === 0) return null
 
@@ -652,7 +682,6 @@ function ActivityList({ txs }: { txs: TxRecord[] }) {
   )
 }
 
-// ─── InfoCard ─────────────────────────────────────────────────────────────────
 function InfoCard() {
   const rows = [
     { icon: <Zap className="size-3.5" style={{ color: 'var(--accent-hover)' }} />, label: 'Sub-second finality' },
@@ -693,13 +722,10 @@ function InfoCard() {
   )
 }
 
-// ─── Main PaymentApp ──────────────────────────────────────────────────────────
 export default function PaymentApp() {
   const { isConnected, address } = useAccount()
   const [txs, setTxs] = useState<TxRecord[]>([])
   const [prefillDismissed, setPrefillDismissed] = useState(false)
-
-  // Sheet open states
   const [sendOpen, setSendOpen] = useState(false)
   const [prefillTo, setPrefillTo] = useState('')
   const [prefillAmount, setPrefillAmount] = useState('')
@@ -707,8 +733,6 @@ export default function PaymentApp() {
   const [bridgeOpen, setBridgeOpen] = useState(false)
   const [qrOpen, setQrOpen] = useState(false)
   const [privacyOpen, setPrivacyOpen] = useState(false)
-
-  // Privacy settings applied to the next send
   const [pendingPrivacy, setPendingPrivacy] = useState<PrivacySettings | null>(null)
 
   const openSend = () => {
@@ -753,7 +777,7 @@ export default function PaymentApp() {
     })
   }
 
-  // ── Agent intent handlers ────────────────────────────────────────────────────
+  // AI Agent handlers
   const handleAgentSend = useCallback((intent: AgentIntent) => {
     setPrefillTo(intent.to ?? '')
     setPrefillAmount(intent.amount ?? '')
@@ -769,7 +793,6 @@ export default function PaymentApp() {
     setRequestOpen(true)
   }, [])
 
-  // Bottom toolbar items
   const toolbarItems = [
     { icon: <ArrowLeftRight className="size-5" />, label: 'Bridge', action: () => setBridgeOpen(true) },
     { icon: <QrCode className="size-5" />, label: 'Scan QR', action: () => setQrOpen(true) },
@@ -778,7 +801,6 @@ export default function PaymentApp() {
 
   return (
     <div className="min-h-dvh pb-28" style={{ background: 'var(--bg-gradient)' }}>
-      {/* header */}
       <header
         className="sticky top-0 z-40 mx-auto flex max-w-md items-center justify-between px-4 py-3"
         style={{
@@ -802,7 +824,6 @@ export default function PaymentApp() {
         <ConnectKitButton />
       </header>
 
-      {/* content */}
       <main className="mx-auto max-w-md space-y-4 px-4 py-6">
         {!prefillDismissed && (
           <PrefillBanner
@@ -853,7 +874,6 @@ export default function PaymentApp() {
         <InfoCard />
       </main>
 
-      {/* Bottom toolbar */}
       <div className="fixed bottom-0 left-0 right-0 z-40 flex justify-center">
         <div
           className="mx-4 mb-4 flex w-full max-w-md items-center justify-around rounded-3xl px-2 py-3"
@@ -881,7 +901,6 @@ export default function PaymentApp() {
         </div>
       </div>
 
-      {/* Sheets */}
       <SendSheet
         key={`${prefillTo}-${prefillAmount}`}
         open={sendOpen}
@@ -900,7 +919,7 @@ export default function PaymentApp() {
         onApply={handlePrivacyApply}
       />
 
-      {/* AI Agent chat widget */}
+      {/* AI Agent */}
       <ChatWidget
         onSendIntent={handleAgentSend}
         onBridgeIntent={handleAgentBridge}
