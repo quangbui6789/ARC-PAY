@@ -1,15 +1,10 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { createPublicClient, http, erc20Abi, formatUnits } from 'viem'
-import { getUsdc, getChain } from '../src/onchain-facts'
 
-const ARC_TESTNET_ID = 5042002
-const usdcFact = getUsdc(ARC_TESTNET_ID)!
-const chainFact = getChain(ARC_TESTNET_ID)!
-
-const USDC_ADDRESS = usdcFact.address as `0x${string}`
-const USDC_DECIMALS = usdcFact.decimals
-
-const rpcUrl = chainFact.rpcUrls[0]
+// Hardcode values (tránh import từ src/)
+const USDC_ADDRESS = '0x3600000000000000000000000000000000000000' as `0x${string}`
+const USDC_DECIMALS = 6
+const RPC_URL = 'https://rpc.testnet.arc.io'
 
 const SUPPORTED_BRIDGE_CHAINS: Record<string, string> = {
   arc: 'Arc_Testnet',
@@ -40,7 +35,7 @@ interface Intent {
 
 async function fetchBalance(address: string): Promise<string> {
   try {
-    const client = createPublicClient({ transport: http(rpcUrl) })
+    const client = createPublicClient({ transport: http(RPC_URL) })
     const raw = await client.readContract({
       address: USDC_ADDRESS,
       abi: erc20Abi,
